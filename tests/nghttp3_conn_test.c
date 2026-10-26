@@ -49,6 +49,8 @@ static const MunitTest tests[] = {
   munit_void_test(test_nghttp3_conn_http_non_final_response),
   munit_void_test(test_nghttp3_conn_http_trailers),
   munit_void_test(test_nghttp3_conn_http_ignore_content_length),
+  munit_void_test(test_nghttp3_conn_http_connect_2xx_tunnel),
+  munit_void_test(test_nghttp3_conn_http_connect_failure_content_length),
   munit_void_test(test_nghttp3_conn_http_record_request_method),
   munit_void_test(test_nghttp3_conn_http_error),
   munit_void_test(test_nghttp3_conn_qpack_blocked_stream),
@@ -3627,6 +3629,152 @@ void test_nghttp3_conn_http_ignore_content_length(void) {
 
   nghttp3_conn_del(conn);
   nghttp3_qpack_encoder_free(&qenc);
+}
+
+static int tunnel_response_data(nghttp3_conn *conn, int64_t stream_id,
+                                const uint8_t *data, size_t datalen,
+                                void *user_data, void *stream_user_data) {
+  size_t *received = user_data;
+  size_t i;
+
+  (void)conn;
+  (void)stream_user_data;
+
+  assert_int64(0, ==, stream_id);
+  for (i = 0; i < datalen; ++i) {
+    assert_uint8('a', ==, data[i]);
+  }
+  *received += datalen;
+
+  return 0;
+}
+
+static void check_http_tunnel_response(const char *method, const char *status,
+                                       const char *content_length,
+                                       size_t datalen, int64_t expected_length,
+                                       int expected_error) {
+  const nghttp3_mem *mem = nghttp3_mem_default();
+  uint8_t rawbuf[4096];
+  nghttp3_buf buf;
+  nghttp3_frame fr;
+  nghttp3_qpack_encoder qenc;
+  nghttp3_conn *conn;
+  nghttp3_stream *stream;
+  nghttp3_ssize sconsumed;
+  size_t received = 0;
+  size_t first = datalen < 3 ? datalen : 3;
+  nghttp3_nv request[] = {
+    MAKE_NV(":method", "GET"), MAKE_NV(":authority", "localhost:443"),
+    MAKE_NV(":scheme", "https"), MAKE_NV(":path", "/"),
+  };
+  nghttp3_nv response[] = {
+    MAKE_NV(":status", "200"), MAKE_NV("content-length", "0"),
+  };
+  nghttp3_callbacks callbacks = {
+    .recv_data = tunnel_response_data,
+  };
+  conn_options opts = {
+    .callbacks = &callbacks,
+    .user_data = &received,
+  };
+  int rv;
+
+  request[0].value = (uint8_t *)method;
+  request[0].valuelen = strlen(method);
+  response[0].value = (uint8_t *)status;
+  response[0].valuelen = strlen(status);
+  if (content_length) {
+    response[1].value = (uint8_t *)content_length;
+    response[1].valuelen = strlen(content_length);
+  }
+
+  setup_default_client_with_options(&conn, opts);
+  rv = nghttp3_conn_submit_request(conn, 0, request,
+                                   strcmp(method, "CONNECT") == 0 ? 2 : 4,
+                                   NULL, NULL);
+  assert_int(0, ==, rv);
+  stream = nghttp3_conn_find_stream(conn, 0);
+  assert_not_null(stream);
+
+  nghttp3_buf_wrap_init(&buf, rawbuf, sizeof(rawbuf));
+  nghttp3_qpack_encoder_init(&qenc, 0, NGHTTP3_TEST_MAP_SEED, mem);
+  fr.headers = (nghttp3_frame_headers){
+    .type = NGHTTP3_FRAME_HEADERS,
+    .nva = response,
+    .nvlen = content_length ? 2 : 1,
+  };
+  nghttp3_write_frame_qpack(&buf, &qenc, 0, &fr);
+  if (first) {
+    nghttp3_write_frame_data(&buf, first);
+    memset(buf.last - first, 'a', first);
+  }
+  if (datalen > first) {
+    nghttp3_write_frame_data(&buf, datalen - first);
+    memset(buf.last - (datalen - first), 'a', datalen - first);
+  }
+
+  sconsumed = nghttp3_conn_read_stream2(conn, 0, buf.pos, nghttp3_buf_len(&buf),
+                                        /* fin = */ 1, 0);
+  if (expected_error) {
+    assert_ptrdiff(expected_error, ==, sconsumed);
+    if (expected_length == 0) {
+      assert_size(0, ==, received);
+    }
+  } else {
+    assert_ptrdiff((nghttp3_ssize)(nghttp3_buf_len(&buf) - datalen), ==,
+                   sconsumed);
+    assert_size(datalen, ==, received);
+    assert_int64(expected_length, ==, stream->rx.http.content_length);
+    assert_int64((int64_t)datalen, ==, stream->rx.http.recv_content_length);
+    assert_enum(nghttp3_stream_http_state, NGHTTP3_HTTP_STATE_RESP_END, ==,
+                stream->rx.hstate);
+  }
+
+  nghttp3_conn_del(conn);
+  nghttp3_qpack_encoder_free(&qenc);
+}
+
+void test_nghttp3_conn_http_connect_2xx_tunnel(void) {
+  static const char *const statuses[] = {"200", "201", "204", "299"};
+  size_t i;
+
+  for (i = 0; i < nghttp3_arraylen(statuses); ++i) {
+    /* All successful CONNECT responses carry tunnel DATA.  Even an
+       invalid Content-Length must be ignored, not used for framing. */
+    check_http_tunnel_response("CONNECT", statuses[i], NULL, 7, -1, 0);
+    check_http_tunnel_response("CONNECT", statuses[i], "0", 7, -1, 0);
+    check_http_tunnel_response("CONNECT", statuses[i], "3", 7, -1, 0);
+    check_http_tunnel_response("CONNECT", statuses[i], "invalid", 7, -1, 0);
+  }
+
+  /* Ordinary response content rules still apply outside a tunnel. */
+  check_http_tunnel_response("GET", "204", NULL, 0, 0, 0);
+  check_http_tunnel_response("GET", "204", "0", 1, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("GET", "204", "3", 0, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_HEADER);
+  check_http_tunnel_response("HEAD", "200", "7", 0, 0, 0);
+  check_http_tunnel_response("HEAD", "200", "7", 1, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("HEAD", "204", NULL, 1, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("GET", "304", "7", 1, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("GET", "200", "7", 7, 7, 0);
+}
+
+void test_nghttp3_conn_http_connect_failure_content_length(void) {
+  check_http_tunnel_response("CONNECT", "404", "3", 3, 3, 0);
+  check_http_tunnel_response("CONNECT", "404", "3", 4, 3,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("CONNECT", "404", "3", 2, 3,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("CONNECT", "407", "0", 1, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
+  check_http_tunnel_response("CONNECT", "302", "3", 3, 3, 0);
+  check_http_tunnel_response("CONNECT", "404", NULL, 7, -1, 0);
+  check_http_tunnel_response("CONNECT", "304", "7", 1, 0,
+                             NGHTTP3_ERR_MALFORMED_HTTP_MESSAGING);
 }
 
 void test_nghttp3_conn_http_record_request_method(void) {

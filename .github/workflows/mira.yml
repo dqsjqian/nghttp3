@@ -1,0 +1,46 @@
+name: mira
+on:
+  push:
+    branches: [mira]
+  pull_request:
+    branches: [mira]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mira-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-archive:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify source archive reproducibility
+        run: python maintainer/test_package.py
+      - name: Package committed source and pinned submodules
+        run: python maintainer/package.py
+      - name: Build and test source archive
+        shell: bash
+        run: |
+          mkdir -p build/source
+          tar -xf build/dist/nghttp3-1.18.0-mira.1.tar.xz -C build/source
+          cmake -S build/source/nghttp3-1.18.0-mira.1 -B build/verify -DCMAKE_BUILD_TYPE=Release -DENABLE_LIB_ONLY=ON -DENABLE_SHARED_LIB=OFF -DENABLE_STATIC_LIB=ON -DBUILD_TESTING=ON
+          cmake --build build/verify --config Release --target main --parallel 4
+          ctest --test-dir build/verify -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: nghttp3-source
+          path: build/dist/*
