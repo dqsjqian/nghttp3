@@ -14,7 +14,11 @@ import tarfile
 
 
 def git(root: Path, *args: str) -> bytes:
-    return subprocess.check_output(["git", "-C", str(root), *args])
+    # git archive otherwise applies local line-ending and permission settings.
+    return subprocess.check_output([
+        "git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+        "-c", "tar.umask=0022", "-C", str(root), *args,
+    ])
 
 
 def collect(root: Path, revision: str, prefix: str, entries: dict,

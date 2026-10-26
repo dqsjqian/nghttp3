@@ -27,6 +27,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+      - name: Verify source archive reproducibility
+        run: python maintainer/test_package.py
       - name: Package committed source and pinned submodules
         run: python maintainer/package.py
       - name: Build and test source archive
