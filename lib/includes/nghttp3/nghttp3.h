@@ -52,6 +52,14 @@ extern "C" {
 
 #include <nghttp3/version.h>
 
+/**
+ * @macro
+ *
+ * Successful CONNECT 2xx responses allow tunnel DATA without a content
+ * length limit and ignore Content-Length, including status 204.
+ */
+#define NGHTTP3_HAS_CONNECT_2XX_TUNNEL 1
+
 #ifdef NGHTTP3_STATICLIB
 #  define NGHTTP3_EXTERN
 #elif defined(WIN32)

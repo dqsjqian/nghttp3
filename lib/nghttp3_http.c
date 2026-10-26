@@ -481,6 +481,13 @@ static int http_response_on_header(nghttp3_http_state *http,
     if (trailers) {
       return NGHTTP3_ERR_REMOVE_HTTP_HEADER;
     }
+    if (http->status_code / 100 == 1 ||
+        /* RFC 9110 Section 9.3.6: successful CONNECT establishes a
+           tunnel, including status 204.  Content-Length is ignored. */
+        (http->status_code / 100 == 2 &&
+         (http->flags & NGHTTP3_HTTP_FLAG_METH_CONNECT))) {
+      return NGHTTP3_ERR_REMOVE_HTTP_HEADER;
+    }
     if (http->status_code == 204) {
       /* content-length header field in 204 response is prohibited by
          RFC 7230.  But some widely used servers send content-length:
@@ -491,12 +498,6 @@ static int http_response_on_header(nghttp3_http_state *http,
         return NGHTTP3_ERR_MALFORMED_HTTP_HEADER;
       }
       http->content_length = 0;
-      return NGHTTP3_ERR_REMOVE_HTTP_HEADER;
-    }
-    if (http->status_code / 100 == 1 ||
-        /* https://tools.ietf.org/html/rfc7230#section-3.3.3 */
-        (http->status_code / 100 == 2 &&
-         (http->flags & NGHTTP3_HTTP_FLAG_METH_CONNECT))) {
       return NGHTTP3_ERR_REMOVE_HTTP_HEADER;
     }
     if (http->content_length != -1) {
@@ -617,10 +618,12 @@ int nghttp3_http_on_response_headers(nghttp3_http_state *http) {
 
   http->flags &= ~NGHTTP3_HTTP_FLAG_EXPECT_FINAL_RESPONSE;
 
-  if (!expect_response_body(http)) {
-    http->content_length = 0;
-  } else if (http->flags & NGHTTP3_HTTP_FLAG_METH_CONNECT) {
+  if ((http->flags & NGHTTP3_HTTP_FLAG_METH_CONNECT) &&
+      http->status_code / 100 == 2) {
+    /* A successful CONNECT carries tunnel DATA, not response content. */
     http->content_length = -1;
+  } else if (!expect_response_body(http)) {
+    http->content_length = 0;
   }
 
   return 0;
