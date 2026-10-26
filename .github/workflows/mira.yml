@@ -1,9 +1,9 @@
 name: mira
 on:
   push:
-    branches: [mira]
+    branches: [main]
   pull_request:
-    branches: [mira]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
